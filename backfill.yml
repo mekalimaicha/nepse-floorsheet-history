@@ -1,0 +1,105 @@
+name: Historical Backfill
+
+on:
+  schedule:
+    # Two night shifts, both inside 7:00 PM - 7:00 AM Nepal time.
+    # Shift 1 starts 7:05 PM NPT (13:20 UTC), shift 2 starts 12:45 AM NPT (19:00 UTC).
+    - cron: "20 13 * * *"
+    - cron: "0 19 * * *"
+  workflow_dispatch:      # Actions > Historical Backfill > Run workflow : starts immediately
+    inputs:
+      budget_minutes:
+        description: "Minutes each of the two steps may run (default 150)"
+        required: false
+        default: "150"
+
+permissions:
+  contents: write
+  actions: write      # lets the finished workflow switch itself off
+
+concurrency:
+  group: floorsheet-git-push
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Already finished?
+        id: gate
+        run: |
+          if python scraper/check_done.py; then
+            echo "finished=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "finished=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Switch this workflow off (everything is complete)
+        if: ${{ steps.gate.outputs.finished == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable backfill.yml
+
+      - name: Install dependencies
+        if: ${{ steps.gate.outputs.finished != 'true' }}
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: History from nepalstock (with trade time, newest dates first)
+        if: ${{ steps.gate.outputs.finished != 'true' }}
+        run: python scraper/nepse_history.py --budget-minutes "${{ github.event.inputs.budget_minutes || 150 }}"
+        continue-on-error: true
+
+      - name: History from Merolagani (older dates, no trade time)
+        if: ${{ steps.gate.outputs.finished != 'true' }}
+        run: python scraper/scrape.py backfill --budget-minutes "${{ github.event.inputs.budget_minutes || 150 }}"
+
+      - name: Data check (coverage report, non-trading list)
+        if: ${{ always() && steps.gate.outputs.finished != 'true' }}
+        run: |
+          if python scraper/check_done.py; then
+            python scraper/check_data.py --deep
+          else
+            python scraper/check_data.py
+          fi
+
+      - name: Save debug files if something failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
+
+      - name: Commit data and progress
+        if: ${{ always() && steps.gate.outputs.finished != 'true' }}
+        run: |
+          git config user.name "floorsheet-bot"
+          git config user.email "floorsheet-bot@users.noreply.github.com"
+          mkdir -p data state reports
+          git add data state reports
+          git diff --cached --quiet && echo "Nothing new to commit" && exit 0
+          git commit -m "Backfill progress $(date -u +%F-%H%M)"
+          for i in 1 2 3 4 5; do
+            git pull --rebase -X theirs && git push && exit 0
+            sleep 15
+          done
+          exit 1
+
+      - name: Switch this workflow off if the work is now complete
+        if: ${{ always() && steps.gate.outputs.finished != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if python scraper/check_done.py; then
+            gh workflow disable backfill.yml
+          fi

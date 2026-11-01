@@ -1,0 +1,71 @@
+name: Daily Floorsheet
+
+on:
+  schedule:
+    # 3:30 PM Nepal time (UTC+5:45) = 09:45 UTC. Monday to Friday (Saturday and Sunday are closed from 2026-10-30).
+    - cron: "45 9 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Optional: force Merolagani scrape of one date YYYY-MM-DD (no trade time). Blank = nepalstock, latest day."
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: floorsheet-git-push
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Scrape from nepalstock.com (has trade time)
+        id: nepal
+        if: ${{ github.event.inputs.date == '' }}
+        continue-on-error: true
+        run: python scraper/nepse_daily.py
+
+      - name: Fallback - scrape from Merolagani (no trade time; also detects holidays)
+        if: ${{ github.event.inputs.date != '' || steps.nepal.outcome == 'failure' }}
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python scraper/scrape.py daily --date "${{ github.event.inputs.date }}"
+          else
+            python scraper/scrape.py daily
+          fi
+
+      - name: Save debug files if something failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
+
+      - name: Commit data
+        if: ${{ always() }}
+        run: |
+          git config user.name "floorsheet-bot"
+          git config user.email "floorsheet-bot@users.noreply.github.com"
+          mkdir -p data state reports
+          git add data state reports
+          git diff --cached --quiet && echo "Nothing new to commit" && exit 0
+          git commit -m "Daily floorsheet $(date -u +%F)"
+          for i in 1 2 3 4 5; do
+            git pull --rebase -X theirs && git push && exit 0
+            sleep 15
+          done
+          exit 1
